@@ -28,20 +28,31 @@ import org.apache.hadoop.hive.serde2.SerDeException;
 import org.apache.hadoop.hive.serde2.SerDeStats;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
+import org.apache.hadoop.hive.serde2.ColumnProjectionUtils;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.mapred.JobConf;
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
+import org.apache.hadoop.conf.Configuration;
+import java.util.List;
+import java.util.Properties;
+import java.util.ArrayList;
+import java.util.StringTokenizer;
+import java.util.Collections;
 
 /**
  * Read or write Avro data from Hive.
  */
 public class AvroSerDe implements SerDe {
   private static final Log LOG = LogFactory.getLog(AvroSerDe.class);
-
+  private static final String READ_COLUMN_IDS_CONF_STR = "hive.io.file.readcolumn.ids";
+  private static final String COLSELECTIVE_SERDE="haivvreo.colselective";
   public static final String HAIVVREO_SCHEMA = "haivvreo.schema";
   private ObjectInspector oi;
   private List<String> columnNames;
@@ -51,6 +62,7 @@ public class AvroSerDe implements SerDe {
   private AvroSerializer avroSerializer = null;
 
   private boolean badSchema = false;
+   private List<Integer> colArray = null;
 
   @Override
   public void initialize(Configuration configuration, Properties properties) throws SerDeException {
@@ -75,12 +87,58 @@ public class AvroSerDe implements SerDe {
     }
 
     badSchema = schema.equals(SchemaResolutionProblem.SIGNAL_BAD_SCHEMA);
-
+    
     AvroObjectInspectorGenerator aoig = new AvroObjectInspectorGenerator(schema);
     this.columnNames = aoig.getColumnNames();
     this.columnTypes = aoig.getColumnTypes();
     this.oi = aoig.getObjectInspector();
+    // Populate column array if configuration has one.
+    generateColArray(configuration, properties);
+    
+    
   }
+
+  private void generateColArray(Configuration configuration, 
+                                Properties properties)
+  {
+    this.colArray = null;  
+    String colselectiveprop = null;
+
+    if (properties != null)
+      colselectiveprop = properties.getProperty(COLSELECTIVE_SERDE);
+
+    if ((colselectiveprop == null || colselectiveprop.equals("TRUE")) &&
+	configuration != null){
+      String tableName = "";
+      if (properties != null) 
+	tableName = properties.getProperty("name");
+
+      this.colArray = ColumnProjectionUtils.getReadColumnIDs(configuration);
+      LOG.info("Avro DEBUG: Hive Column Projection vector for table " + tableName + " "+ this.colArray.toString());
+      // For "Select *" type queries, the column array comes in empty. handle
+      // this similar to the case where optimization is disabled.
+      if (this.colArray.size()==0)
+	this.colArray= null;
+      
+    }
+
+    if (this.colArray == null) return;
+    // sort and eliminate duplicates
+    Collections.sort(this.colArray);
+    // Handle possible repeated values in the array which Hive code passes to us.
+    ArrayList<Integer> qCols = new ArrayList<Integer>();
+    Integer prevqc  = new Integer(-1);
+    for (Integer qc: this.colArray){
+      if (qc != prevqc)
+	qCols.add(qc);
+      prevqc = qc;
+    }
+      
+    this.colArray = qCols;
+    LOG.info("Avro DEBUG: Final Column Projection Vector "+this.colArray.toString());
+  }
+
+
 
   // Hive passes different properties in at different times.  If we're in a MR job,
   // we'll get properties for the partition rather than the table, which will give
@@ -148,8 +206,10 @@ public class AvroSerDe implements SerDe {
   }
 
   private AvroDeserializer getDeserializer() {
-    if(avroDeserializer == null) avroDeserializer = new AvroDeserializer();
-
+    if(avroDeserializer == null) {
+      avroDeserializer = new AvroDeserializer();
+      avroDeserializer.setQueryCols(colArray);
+    }
     return avroDeserializer;
   }
 
